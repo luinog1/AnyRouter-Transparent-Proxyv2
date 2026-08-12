@@ -1,7 +1,6 @@
-"""
-FastAPI application entrypoint and transparent upstream proxy.
-"""
+"""FastAPI entrypoint and transparent upstream proxy."""
 
+import os
 import time
 from typing import Optional
 
@@ -9,14 +8,15 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 
-from config import (
+from backend.config import (
     CUSTOM_HEADERS,
     DEBUG_MODE,
-    TARGET_BASE_URL,
     HOP_BY_HOP_HEADERS,
+    TARGET_BASE_URL,
 )
 
 app = FastAPI()
+PORT = int(os.getenv("PORT", "8000"))
 
 http_client = httpx.AsyncClient(
     timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0),
@@ -41,12 +41,10 @@ def is_claude_messages(path: str) -> bool:
 
 
 def ensure_agentrouter_claude_headers(headers: dict) -> dict:
-    """Preserve Claude Code's real fingerprint and fill only safe required defaults."""
+    """Preserve Claude Code's real fingerprint and fill only safe defaults."""
     lowered = {k.lower() for k in headers}
     if "anthropic-version" not in lowered:
         headers["anthropic-version"] = "2023-06-01"
-    # AgentRouter expects the Claude Code/Anthropic request shape. Do not replace
-    # User-Agent, x-stainless-* or authentication headers supplied by Claude Code.
     if "user-agent" not in lowered:
         headers["user-agent"] = "claude-code"
     return headers
@@ -55,6 +53,11 @@ def ensure_agentrouter_claude_headers(headers: dict) -> dict:
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "AnyRouter Transparent Proxy", "target": TARGET_BASE_URL}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
 
 
 @app.get("/favicon.ico")
@@ -76,12 +79,7 @@ async def proxy(path: str, request: Request):
     if request.url.query:
         target_url += "?" + request.url.query
 
-    incoming_headers = list(request.headers.items())
-    client_host = request.client.host if request.client else None
-    forward_headers = prepare_forward_headers(incoming_headers, client_host)
-
-    # Claude Code calls /v1/messages?beta=true. Preserve the query exactly as
-    # supplied; only add the Anthropic version header when it is absent.
+    forward_headers = prepare_forward_headers(list(request.headers.items()))
     if is_claude_messages(path):
         forward_headers = ensure_agentrouter_claude_headers(forward_headers)
 
@@ -96,7 +94,6 @@ async def proxy(path: str, request: Request):
             content=body,
         )
         resp = await http_client.send(req, stream=True)
-
         elapsed = time.time() - start_time
         print(
             f"[Upstream] {request.method} /{path} -> {resp.status_code} "
@@ -137,3 +134,14 @@ async def proxy(path: str, request: Request):
     except httpx.HTTPError as exc:
         print(f"[Upstream] error {request.method} /{path}: {exc}")
         return JSONResponse({"error": "upstream connection error"}, status_code=502)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "backend.app:app",
+        host="0.0.0.0",
+        port=PORT,
+        proxy_headers=True,
+    )
