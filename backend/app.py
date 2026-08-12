@@ -7,7 +7,8 @@ import time
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from backend.config import CUSTOM_HEADERS, DEBUG_MODE, HOP_BY_HOP_HEADERS, TARGET_BASE_URL
 
@@ -19,9 +20,6 @@ http_client = httpx.AsyncClient(
     follow_redirects=False,
 )
 
-# AgentRouter's WAF expects the Anthropic Messages request to resemble Claude
-# Code rather than a generic Anthropic SDK request. Keep the versioned beta
-# list in one place so it can be updated without touching the proxy logic.
 AGENTROUTER_BETA = os.getenv(
     "AGENTROUTER_ANTHROPIC_BETA",
     "claude-code-20250219,interleaved-thinking-2025-05-14,effort-2025-11-24,redact-thinking-2026-02-12",
@@ -42,22 +40,19 @@ def forward_headers(request: Request) -> dict[str, str]:
 
 
 def apply_claude_code_wire_image(headers: dict[str, str]) -> dict[str, str]:
-    """Make the upstream request look like Claude Code while preserving auth."""
-    # Keep the real API credential supplied by Claude Code/CC-Switch. AgentRouter
-    # accepts Anthropic-style x-api-key or Authorization depending on the client.
+    """Make only upstream /v1/messages requests resemble Claude Code."""
     headers["anthropic-version"] = headers.get("anthropic-version", "2023-06-01")
     headers["anthropic-beta"] = AGENTROUTER_BETA
     headers["anthropic-dangerous-direct-browser-access"] = "true"
     headers["x-app"] = "cli"
     headers["user-agent"] = CLAUDE_CODE_UA
-
-    # The Stainless headers are part of the Claude Code wire image. Preserve any
-    # headers already supplied by the current Claude Code client and only add the
-    # stable package/runtime identifiers when absent.
     headers.setdefault("x-stainless-lang", "js")
     headers.setdefault("x-stainless-package-version", STAINLESS_PACKAGE)
     headers.setdefault("x-stainless-runtime", "node")
-    headers.setdefault("x-stainless-runtime-version", os.getenv("CLAUDE_STAINLESS_RUNTIME_VERSION", "v24.3.0"))
+    headers.setdefault(
+        "x-stainless-runtime-version",
+        os.getenv("CLAUDE_STAINLESS_RUNTIME_VERSION", "v24.3.0"),
+    )
     headers.setdefault("x-stainless-arch", platform.machine())
     headers.setdefault("x-stainless-os", sys.platform)
     return headers
@@ -68,13 +63,11 @@ def is_claude_messages(path: str) -> bool:
 
 
 @app.get("/")
-@app.head("/")
 async def root():
-    return Response(status_code=200, headers={"x-proxy-status": "ok"})
+    return RedirectResponse(url="/admin/", status_code=307)
 
 
 @app.get("/health")
-@app.head("/health")
 async def health():
     return {"status": "healthy"}
 
@@ -151,6 +144,12 @@ async def proxy(path: str, request: Request):
     except httpx.HTTPError as exc:
         print(f"[Upstream] error {request.method} /{path}: {exc}")
         return JSONResponse({"error": "upstream connection error"}, status_code=502)
+
+
+# The Vue dashboard is built by Docker into /app/static with base=/admin/.
+# Mount it after the API routes so /v1/* and /health remain handled by Python.
+if os.path.isdir("/app/static"):
+    app.mount("/admin", StaticFiles(directory="/app/static", html=True), name="admin")
 
 
 if __name__ == "__main__":
