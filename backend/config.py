@@ -1,22 +1,20 @@
 """
-配置管理模块
+Configuração central da aplicação.
 
-负责加载和管理所有应用配置，包括环境变量和自定义请求头
+Carrega variáveis de ambiente e configurações de headers.
 """
 
 from dotenv import load_dotenv
 import json
 import os
 
-# 加载环境变量
 load_dotenv(dotenv_path="env/.env", override=True)
 
-# ===== 基础配置 =====
-# AgentRouter 的 Anthropic-compatible API host。
-# 注意：AgentRouter 的文档明确区分网站域名与 API 域名：Anthropic 使用
-# https://co.agentrouter.org（不在这里追加 /v1）；OpenAI-compatible 使用
-# https://co.agentrouter.org/v1。
-TARGET_BASE_URL = os.getenv("API_BASE_URL", "https://co.agentrouter.org").rstrip("/")
+# ===== Basic configuration =====
+# AgentRouter API base URL.
+# Keep this configurable so the deployment can override it when necessary.
+# The user-facing provider endpoint is https://agentrouter.org.
+TARGET_BASE_URL = os.getenv("API_BASE_URL", "https://agentrouter.org").rstrip("/")
 PRESERVE_HOST = False
 
 SYSTEM_PROMPT_REPLACEMENT = os.getenv("SYSTEM_PROMPT_REPLACEMENT")
