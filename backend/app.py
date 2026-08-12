@@ -1,337 +1,231 @@
-"""
-AnyRouter 透明代理 - 主应用模块
+"""AnyRouter / AgentRouter transparent proxy service."""
 
-基于 FastAPI 的轻量级透明 HTTP 代理服务
-"""
-
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import StreamingResponse, RedirectResponse
 from contextlib import asynccontextmanager
-from starlette.background import BackgroundTask
-import httpx
+from typing import Optional
+import asyncio
 import json
 import os
 import socket
 import time
-import asyncio
 import uuid
 
-# 导入配置
-from .config import (
-    TARGET_BASE_URL,
-    DEBUG_MODE,
-    PORT,
-    ENABLE_DASHBOARD,
-    DASHBOARD_API_KEY,
-    CUSTOM_HEADERS
-)
+import httpx
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import RedirectResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
-# 导入统计服务
+from .config import TARGET_BASE_URL, DEBUG_MODE, PORT, ENABLE_DASHBOARD, DASHBOARD_API_KEY, CUSTOM_HEADERS
 from .services.stats import (
     record_request_start,
     record_request_success,
     record_request_error,
     periodic_stats_update,
-    cleanup_stale_requests
+    cleanup_stale_requests,
 )
-
-# 导入代理服务
-from .services.proxy import (
-    process_request_body,
-    filter_response_headers,
-    prepare_forward_headers
-)
-
-# 导入编码工具
+from .services.proxy import process_request_body, filter_response_headers, prepare_forward_headers
+from .services.proxy_pool import ProxyPool
 from .utils.encoding import ensure_unicode
-
-# 导入 Admin 路由
 from .routers.admin import router as admin_router
 
-# Shared HTTP client for connection pooling and proper lifecycle management
-http_client: httpx.AsyncClient = None  # type: ignore
+http_client: Optional[httpx.AsyncClient] = None
+proxy_clients: dict[str, httpx.AsyncClient] = {}
+proxy_client_last_used: dict[str, float] = {}
+proxy_clients_lock = asyncio.Lock()
+MAX_CACHED_PROXY_CLIENTS = int(os.getenv("MAX_CACHED_PROXY_CLIENTS", "16"))
+proxy_pool = ProxyPool()
+
+
+async def get_proxy_client(proxy_url: str) -> httpx.AsyncClient:
+    """Return a reusable HTTP client for one upstream proxy."""
+    async with proxy_clients_lock:
+        client = proxy_clients.get(proxy_url)
+        if client is None:
+            client = httpx.AsyncClient(
+                proxy=proxy_url,
+                follow_redirects=False,
+                timeout=httpx.Timeout(90.0, connect=15.0),
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10, keepalive_expiry=30.0),
+            )
+            proxy_clients[proxy_url] = client
+        proxy_client_last_used[proxy_url] = time.monotonic()
+
+        if len(proxy_clients) > MAX_CACHED_PROXY_CLIENTS:
+            oldest = min(proxy_client_last_used, key=proxy_client_last_used.get)
+            if oldest != proxy_url:
+                old_client = proxy_clients.pop(oldest)
+                proxy_client_last_used.pop(oldest, None)
+                await old_client.aclose()
+        return client
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage application lifespan events"""
     global http_client
-
-    # 生成启动标识
     app.state.boot_id = str(uuid.uuid4())
     app.state.started_at = int(time.time())
 
-    # 启动定时统计更新任务
     stats_task = asyncio.create_task(periodic_stats_update())
-
-    # 启动超时请求清理任务
     cleanup_task = asyncio.create_task(cleanup_stale_requests())
 
-    # 输出应用配置信息（只在 worker 进程启动时输出一次）
     print("=" * 60)
-    print("Application Configuration:")
+    print("AgentRouter Transparent Proxy")
     print(f"  Base URL: {TARGET_BASE_URL}")
     print(f"  Server Port: {PORT}")
-    print(f"  Custom Headers: {len(CUSTOM_HEADERS)} headers loaded")
-    if CUSTOM_HEADERS:
-        print(f"  Custom Headers Keys: {list(CUSTOM_HEADERS.keys())}")
-    print(f"  Debug Mode: {DEBUG_MODE}")
-    print(f"  Hot Reload: {DEBUG_MODE}")
-    print(f"  Dashboard Enabled: {ENABLE_DASHBOARD}")
-    if ENABLE_DASHBOARD:
-        print(f"  Dashboard API Key Configured: {'Yes' if DASHBOARD_API_KEY else 'No'}")
-        if DASHBOARD_API_KEY:
-            print(f"  Dashboard Access: http://localhost:{PORT}/admin")
+    print(f"  Proxy Pool: {proxy_pool.enabled} ({len(proxy_pool._states)} proxies)")
+    print(f"  Dashboard: {ENABLE_DASHBOARD}")
     print("=" * 60)
 
-    # 读取代理配置
     http_proxy = os.getenv("HTTP_PROXY")
     https_proxy = os.getenv("HTTPS_PROXY")
-
-    # 构建 mounts 配置（httpx 0.28.0+ 的新语法）
     mounts = {}
-
     if http_proxy:
-        # 确保代理 URL 包含协议
         if "://" not in http_proxy:
-            http_proxy = f"http://{http_proxy}"
+            http_proxy = "http://" + http_proxy
         mounts["http://"] = httpx.AsyncHTTPTransport(proxy=http_proxy)
-        print(f"HTTP Proxy configured: {http_proxy}")
-
     if https_proxy:
-        # 注意：HTTPS 代理通常也使用 http:// 协议（这不是错误！）
         if "://" not in https_proxy:
-            https_proxy = f"http://{https_proxy}"
+            https_proxy = "http://" + https_proxy
         mounts["https://"] = httpx.AsyncHTTPTransport(proxy=https_proxy)
-        print(f"HTTPS Proxy configured: {https_proxy}")
 
-    try:
-        # 使用新的 mounts 参数初始化客户端
-        if mounts:
-            http_client = httpx.AsyncClient(
-                follow_redirects=False,
-                timeout=60.0,
-                mounts=mounts
-            )
-            print(f"HTTP client initialized with proxy mounts: {list(mounts.keys())}")
-        else:
-            http_client = httpx.AsyncClient(
-                follow_redirects=False,
-                timeout=60.0
-            )
-            print("HTTP client initialized without proxy")
-    except Exception as e:
-        print(f"Failed to initialize HTTP client: {e}")
-        raise
-
-    print("=" * 60)
+    http_client = httpx.AsyncClient(
+        follow_redirects=False,
+        timeout=httpx.Timeout(90.0, connect=15.0),
+        mounts=mounts or None,
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=30, keepalive_expiry=30.0),
+    )
 
     yield
 
-    # Shutdown: Close HTTP client and stop background tasks
     stats_task.cancel()
     cleanup_task.cancel()
+    for task in (stats_task, cleanup_task):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
-    try:
-        await stats_task
-    except asyncio.CancelledError:
-        pass
-
-    try:
-        await cleanup_task
-    except asyncio.CancelledError:
-        pass
-
-    await http_client.aclose()
-
-
-def _choose_available_port(preferred_port: int) -> int:
-    """Select an available port, falling back to configured alternatives."""
-    candidates = [preferred_port]
-    fallback_port = int(os.getenv("FALLBACK_PORT", "8088"))
-    if fallback_port not in candidates:
-        candidates.append(fallback_port)
-    # Use 0 as last resort to let OS assign a free port
-    candidates.append(0)
-
-    for port in candidates:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                sock.bind(("0.0.0.0", port))
-                selected_port = sock.getsockname()[1]
-                if selected_port != preferred_port:
-                    print(f"[Port] {preferred_port} unavailable, switching to {selected_port}")
-                return selected_port
-            except OSError as exc:
-                # 无权限或端口占用都视为不可用，尝试下一候选
-                print(f"[Port] Unable to bind {port}: {exc}")
-                continue
-    return preferred_port
+    if http_client:
+        await http_client.aclose()
+    for client in list(proxy_clients.values()):
+        await client.aclose()
+    proxy_clients.clear()
+    proxy_client_last_used.clear()
 
 
-app = FastAPI(
-    title="Anthropic Transparent Proxy",
-    version="1.1",
-    lifespan=lifespan
-)
-
-# 注册 Admin 路由
+app = FastAPI(title="AgentRouter Transparent Proxy", version="2.0", lifespan=lifespan)
 app.include_router(admin_router)
 
 
-# ===== 健康检查端点 =====
-
 @app.get("/health")
 async def health_check(request: Request):
-    """
-    健康检查端点，用于容器健康检查和服务状态监控
-    不依赖上游服务，仅检查代理服务本身是否正常运行
-    """
     return Response(
         content=json.dumps({
             "status": "healthy",
-            "service": "anthropic-transparent-proxy",
+            "service": "agentrouter-transparent-proxy",
             "boot_id": request.app.state.boot_id,
-            "started_at": request.app.state.started_at
+            "started_at": request.app.state.started_at,
+            "target": TARGET_BASE_URL,
+            "proxy_pool": proxy_pool.stats(),
         }),
         media_type="application/json",
-        headers={"Cache-Control": "no-store"}
+        headers={"Cache-Control": "no-store"},
     )
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    # Browser requests to the public URL must never be sent upstream.
+    return Response(status_code=204, headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.api_route("/", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
 async def root_redirect(request: Request):
-    """
-    根路径：浏览器访问时重定向到 /admin，API 访问保持代理行为
-    """
-    accept_header = request.headers.get("accept", "")
-    wants_html = "text/html" in accept_header or "application/xhtml+xml" in accept_header
-
-    if wants_html:
+    accept = request.headers.get("accept", "")
+    if request.method == "GET" and ("text/html" in accept or "application/xhtml+xml" in accept):
         return RedirectResponse(url="/admin", status_code=307)
-
     return await proxy("", request)
 
 
-# ===== 主代理逻辑 =====
-
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
 async def proxy(path: str, request: Request):
-    # 记录请求开始
     start_time = time.time()
     body = await request.body()
 
-    # 跳过 Dashboard 相关路径的统计
+    request_id = None
     if not path.startswith("api/admin") and not path.startswith("admin"):
         request_id = await record_request_start(path, request.method, len(body))
-    else:
-        request_id = None
 
-    # 构造目标 URL
-    query = request.url.query
-    target_url = f"{TARGET_BASE_URL}/{path}"
-    if query:
-        target_url += f"?{query}"
+    target_url = f"{TARGET_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
+    if request.url.query:
+        target_url += "?" + request.url.query
 
-    # 仅测试环境打印详细日志
-    if DEBUG_MODE:
-        try:
-            data = json.loads(body.decode('utf-8'))
-            print(f"[Proxy] Original body ({len(body)} bytes): {json.dumps(data, indent=4)}")
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            print(f"[Proxy] Failed to parse JSON: {e}")
-    else:
-        print(f"[Proxy] Request: {request.method} {path}")
-        print(f"[Proxy] Original body ({len(body)} bytes): {body[:200]}..." if len(body) > 200 else f"[Proxy] Original body: {body}")
-
-    # 处理请求体（替换 system prompt）
-    # 仅在路由为 /v1/messages 时执行处理
-    print(f"[Proxy] Processing request for path: {path}")
-    if path == "v1/messages" or path == "v1/messages/":
+    # Only modify Claude Messages payloads when explicitly configured.
+    if path in {"v1/messages", "v1/messages/"}:
         body = process_request_body(body)
 
-    # 准备转发的请求头
     incoming_headers = list(request.headers.items())
     client_host = request.client.host if request.client else None
     forward_headers = prepare_forward_headers(incoming_headers, client_host)
 
-    # 发起上游请求并流式处理响应
-    response_time = 0
+    selected_proxy = await proxy_pool.choose()
+    client = await get_proxy_client(selected_proxy) if selected_proxy else http_client
+
+    if DEBUG_MODE:
+        print(f"[Proxy] {request.method} /{path} -> {target_url} proxy={bool(selected_proxy)}")
+    else:
+        print(f"[Proxy] {request.method} /{path} -> {target_url} proxy={bool(selected_proxy)}")
+
+    response_time = 0.0
     bytes_received = 0
-    error_response_content = b""  # 新增：缓存错误响应内容（仅当状态码 >= 400 时）
+    error_response_content = b""
+
     try:
-        # 构建请求但不使用 context manager
-        req = http_client.build_request(
+        req = client.build_request(
             method=request.method,
             url=target_url,
             headers=forward_headers,
             content=body,
         )
-
-        # 发送请求并开启流式模式 (不使用 async with)
-        resp = await http_client.send(req, stream=True)
-
-        # 过滤响应头
-        response_headers = filter_response_headers(resp.headers.items())
-
-        # 统计响应时间
+        resp = await client.send(req, stream=True)
         response_time = time.time() - start_time
 
-        # 异步生成器:流式读取响应内容并统计字节数
+        if selected_proxy and resp.status_code < 500:
+            await proxy_pool.report_success(selected_proxy, response_time)
+        elif selected_proxy and resp.status_code >= 500:
+            # A 5xx can be an upstream/model error rather than a dead proxy;
+            # don't immediately evict the proxy.
+            await proxy_pool.report_success(selected_proxy, response_time)
+
+        response_headers = filter_response_headers(resp.headers.items())
+
         async def iter_response():
-            nonlocal bytes_received
-            nonlocal error_response_content
+            nonlocal bytes_received, error_response_content
             try:
                 async for chunk in resp.aiter_bytes():
                     bytes_received += len(chunk)
-                    # 如果是错误响应，缓存内容（限制 50KB）
-                    if resp.status_code >= 400 and len(error_response_content) < 50*1024:
+                    if resp.status_code >= 400 and len(error_response_content) < 50 * 1024:
                         error_response_content += chunk
                     yield chunk
-            except Exception as e:
-                # 优雅处理客户端断开连接
-                if DEBUG_MODE:
-                    print(f"[Stream Error] {e}")
-                # 静默处理,避免日志污染
             finally:
-                # 确保资源被释放 (作为备份,主要由 BackgroundTask 处理)
                 pass
 
-        # 创建响应完成后的统计任务
         async def close_and_record():
             await resp.aclose()
-            if request_id:
-                if resp.status_code < 400:
-                    await record_request_success(
-                        request_id,
-                        path,
-                        request.method,
-                        bytes_received,
-                        response_time,
-                        resp.status_code
-                    )
-                else:
-                    # 使用缓存的响应内容
-                    response_content = ensure_unicode(error_response_content) if error_response_content else None
-                    if DEBUG_MODE:
-                        print(f"[Proxy] Response: {response_content}")
-                    else:
-                        err_content_len = len(error_response_content)
-                        print(f"[Proxy] Response ({err_content_len} bytes): {response_content[:200]}..." if err_content_len > 200 else f"[Proxy] Response: {response_content}")
+            if not request_id:
+                return
+            if resp.status_code < 400:
+                await record_request_success(
+                    request_id, path, request.method, bytes_received,
+                    response_time, resp.status_code,
+                )
+            else:
+                response_content = ensure_unicode(error_response_content) if error_response_content else None
+                await record_request_error(
+                    request_id, path, request.method,
+                    f"HTTP {resp.status_code}: {resp.reason_phrase}",
+                    response_time, response_content, resp.status_code,
+                )
 
-                    # 记录错误到统计服务
-                    await record_request_error(
-                        request_id,
-                        path,
-                        request.method,
-                        f"HTTP {resp.status_code}: {resp.reason_phrase}",
-                        response_time,
-                        response_content,  # 新增参数
-                        resp.status_code
-                    )
-
-        # 使用 BackgroundTask 在响应完成后关闭连接和记录统计
         return StreamingResponse(
             iter_response(),
             status_code=resp.status_code,
@@ -339,36 +233,43 @@ async def proxy(path: str, request: Request):
             background=BackgroundTask(close_and_record),
         )
 
-    except httpx.RequestError as e:
-        # 记录请求错误
+    except (httpx.ProxyError, httpx.ConnectError) as exc:
+        if selected_proxy:
+            await proxy_pool.report_failure(selected_proxy)
         if request_id:
             await record_request_error(
-                request_id,
-                path,
-                request.method,
-                str(e),
-                time.time() - start_time,
-                None,
-                502
+                request_id, path, request.method, str(exc),
+                time.time() - start_time, None, 502,
             )
-        return Response(content=f"Upstream request failed: {e}", status_code=502)
+        return Response(content=f"Upstream connection failed: {exc}", status_code=502)
+    except httpx.RequestError as exc:
+        if request_id:
+            await record_request_error(
+                request_id, path, request.method, str(exc),
+                time.time() - start_time, None, 502,
+            )
+        return Response(content=f"Upstream request failed: {exc}", status_code=502)
+
+
+def _choose_available_port(preferred_port: int) -> int:
+    candidates = [preferred_port]
+    fallback_port = int(os.getenv("FALLBACK_PORT", "8088"))
+    if fallback_port not in candidates:
+        candidates.append(fallback_port)
+    candidates.append(0)
+    for port in candidates:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("0.0.0.0", port))
+                return sock.getsockname()[1]
+            except OSError:
+                continue
+    return preferred_port
 
 
 if __name__ == "__main__":
     import uvicorn
-    # 开发模式启用热重载，生产模式禁用（通过 DEBUG_MODE 环境变量控制）
-    # 注意：使用模块路径而非文件路径，以支持相对导入
     reload_enabled = DEBUG_MODE and os.getenv("ENABLE_RELOAD", "false").lower() in ("true", "1", "yes")
-    if reload_enabled:
-        print("[Uvicorn] Reload enabled via ENABLE_RELOAD")
-    else:
-        print("[Uvicorn] Reload disabled (set ENABLE_RELOAD=true to enable)")
-    try:
-        selected_port = _choose_available_port(PORT)
-        uvicorn.run("backend.app:app", host="0.0.0.0", port=selected_port, reload=reload_enabled)
-    except (PermissionError, OSError) as exc:
-        if reload_enabled:
-            print(f"[Uvicorn] Reload mode failed ({exc}); fallback to non-reload")
-            uvicorn.run("backend.app:app", host="0.0.0.0", port=PORT, reload=False)
-        else:
-            raise
+    selected_port = _choose_available_port(PORT)
+    uvicorn.run("backend.app:app", host="0.0.0.0", port=selected_port, reload=reload_enabled)
