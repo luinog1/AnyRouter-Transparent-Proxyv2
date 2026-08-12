@@ -8,9 +8,9 @@ import time
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 
 from backend.config import CUSTOM_HEADERS, DEBUG_MODE, HOP_BY_HOP_HEADERS, TARGET_BASE_URL
+from backend.routers.admin import router as admin_router
 
 app = FastAPI()
 PORT = int(os.getenv("PORT", "8000"))
@@ -75,6 +75,11 @@ async def health():
 @app.get("/favicon.ico")
 async def favicon():
     return Response(status_code=204)
+
+
+# Register the original dashboard API/static routes BEFORE the catch-all proxy.
+# Otherwise /api/admin/* and /admin/* are incorrectly sent to AgentRouter.
+app.include_router(admin_router)
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
@@ -144,12 +149,6 @@ async def proxy(path: str, request: Request):
     except httpx.HTTPError as exc:
         print(f"[Upstream] error {request.method} /{path}: {exc}")
         return JSONResponse({"error": "upstream connection error"}, status_code=502)
-
-
-# The Vue dashboard is built by Docker into /app/static with base=/admin/.
-# Mount it after the API routes so /v1/* and /health remain handled by Python.
-if os.path.isdir("/app/static"):
-    app.mount("/admin", StaticFiles(directory="/app/static", html=True), name="admin")
 
 
 if __name__ == "__main__":
