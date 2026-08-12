@@ -20,16 +20,9 @@ http_client = httpx.AsyncClient(
     follow_redirects=False,
 )
 
-AGENTROUTER_BETA = os.getenv(
-    "AGENTROUTER_ANTHROPIC_BETA",
-    "claude-code-20250219,interleaved-thinking-2025-05-14,effort-2025-11-24,redact-thinking-2026-02-12",
-)
-CLAUDE_CODE_UA = os.getenv("CLAUDE_CODE_USER_AGENT", "claude-cli/2.1.228 (external, sdk-cli)")
-STAINLESS_PACKAGE = os.getenv("CLAUDE_STAINLESS_PACKAGE_VERSION", "0.94.0")
-
 
 def forward_headers(request: Request) -> dict[str, str]:
-    result: dict[str, str] = {}
+    result = {}
     for key, value in request.headers.items():
         key_lower = key.lower()
         if key_lower in HOP_BY_HOP_HEADERS or key_lower in {"host", "content-length"}:
@@ -39,15 +32,29 @@ def forward_headers(request: Request) -> dict[str, str]:
     return result
 
 
-def apply_claude_code_wire_image(headers: dict[str, str]) -> dict[str, str]:
-    """Make only upstream /v1/messages requests resemble Claude Code."""
+def apply_dynamic_claude_code_wire_image(headers: dict[str, str]) -> dict[str, str]:
+    """Apply the current Claude Code-compatible upstream wire image.
+
+    AgentRouter's WAF expects the Anthropic Messages protocol plus the
+    Claude-Code-compatible identity/headers. Keep client-provided dynamic
+    Stainless headers when present; only fill missing values and avoid a
+    hard-coded CLI version whenever the client supplied one.
+    """
     headers["anthropic-version"] = headers.get("anthropic-version", "2023-06-01")
-    headers["anthropic-beta"] = AGENTROUTER_BETA
-    headers["anthropic-dangerous-direct-browser-access"] = "true"
-    headers["x-app"] = "cli"
-    headers["user-agent"] = CLAUDE_CODE_UA
+    headers["anthropic-beta"] = headers.get(
+        "anthropic-beta",
+        "claude-code-20250219,interleaved-thinking-2025-05-14,effort-2025-11-24,redact-thinking-2026-02-12",
+    )
+    headers["anthropic-dangerous-direct-browser-access"] = headers.get(
+        "anthropic-dangerous-direct-browser-access", "true"
+    )
+    headers["x-app"] = headers.get("x-app", "cli")
+
+    # Preserve the real Claude Code identity if it arrived from the client.
+    # Only provide a current fallback for clients which omit it.
+    headers.setdefault("user-agent", os.getenv("CLAUDE_CODE_USER_AGENT", "claude-cli/2.1.228 (external, sdk-cli)"))
     headers.setdefault("x-stainless-lang", "js")
-    headers.setdefault("x-stainless-package-version", STAINLESS_PACKAGE)
+    headers.setdefault("x-stainless-package-version", os.getenv("CLAUDE_STAINLESS_PACKAGE_VERSION", "0.94.0"))
     headers.setdefault("x-stainless-runtime", "node")
     headers.setdefault(
         "x-stainless-runtime-version",
@@ -77,8 +84,7 @@ async def favicon():
     return Response(status_code=204)
 
 
-# Register the original dashboard API/static routes BEFORE the catch-all proxy.
-# Otherwise /api/admin/* and /admin/* are incorrectly sent to AgentRouter.
+# Keep the original dashboard API/static routes before the proxy catch-all.
 app.include_router(admin_router)
 
 
@@ -87,13 +93,18 @@ async def proxy(path: str, request: Request):
     start_time = time.time()
     body = await request.body()
 
+    # /api/hello is used by some clients as a lightweight endpoint probe.
+    # It must never be forwarded to AgentRouter.
+    if path.strip("/").lower() == "api/hello":
+        return Response(status_code=204)
+
     target_url = f"{TARGET_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
     if request.url.query:
         target_url += "?" + request.url.query
 
     headers = forward_headers(request)
     if is_claude_messages(path):
-        headers = apply_claude_code_wire_image(headers)
+        headers = apply_dynamic_claude_code_wire_image(headers)
 
     if DEBUG_MODE:
         print(f"[Proxy] {request.method} /{path} -> {target_url}")
