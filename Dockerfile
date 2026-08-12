@@ -82,6 +82,9 @@ COPY --from=frontend-builder /app/static ./static/
 # 持久化数据目录（挂载到宿主机 ./data）
 RUN mkdir -p /app/data
 
+# Criar diretório env necessário para o config_service
+RUN mkdir -p /app/env/backups
+
 # 设置目录权限
 RUN chown -R appuser:appuser /app
 USER appuser
