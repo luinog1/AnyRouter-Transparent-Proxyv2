@@ -33,13 +33,7 @@ def forward_headers(request: Request) -> dict[str, str]:
 
 
 def apply_dynamic_claude_code_wire_image(headers: dict[str, str]) -> dict[str, str]:
-    """Apply the current Claude Code-compatible upstream wire image.
-
-    AgentRouter's WAF expects the Anthropic Messages protocol plus the
-    Claude-Code-compatible identity/headers. Keep client-provided dynamic
-    Stainless headers when present; only fill missing values and avoid a
-    hard-coded CLI version whenever the client supplied one.
-    """
+    """Apply the Claude Code-compatible AgentRouter wire image."""
     headers["anthropic-version"] = headers.get("anthropic-version", "2023-06-01")
     headers["anthropic-beta"] = headers.get(
         "anthropic-beta",
@@ -49,17 +43,11 @@ def apply_dynamic_claude_code_wire_image(headers: dict[str, str]) -> dict[str, s
         "anthropic-dangerous-direct-browser-access", "true"
     )
     headers["x-app"] = headers.get("x-app", "cli")
-
-    # Preserve the real Claude Code identity if it arrived from the client.
-    # Only provide a current fallback for clients which omit it.
     headers.setdefault("user-agent", os.getenv("CLAUDE_CODE_USER_AGENT", "claude-cli/2.1.228 (external, sdk-cli)"))
     headers.setdefault("x-stainless-lang", "js")
     headers.setdefault("x-stainless-package-version", os.getenv("CLAUDE_STAINLESS_PACKAGE_VERSION", "0.94.0"))
     headers.setdefault("x-stainless-runtime", "node")
-    headers.setdefault(
-        "x-stainless-runtime-version",
-        os.getenv("CLAUDE_STAINLESS_RUNTIME_VERSION", "v24.3.0"),
-    )
+    headers.setdefault("x-stainless-runtime-version", os.getenv("CLAUDE_STAINLESS_RUNTIME_VERSION", "v24.3.0"))
     headers.setdefault("x-stainless-arch", platform.machine())
     headers.setdefault("x-stainless-os", sys.platform)
     return headers
@@ -79,6 +67,16 @@ async def health():
     return {"status": "healthy"}
 
 
+@app.head("/api/hello")
+async def api_hello_head():
+    return Response(status_code=204)
+
+
+@app.get("/api/hello")
+async def api_hello_get():
+    return {"status": "ok"}
+
+
 @app.get("/favicon.ico")
 async def favicon():
     return Response(status_code=204)
@@ -88,15 +86,9 @@ async def favicon():
 app.include_router(admin_router)
 
 
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
-async def proxy(path: str, request: Request):
+async def proxy_request(path: str, request: Request):
     start_time = time.time()
     body = await request.body()
-
-    # /api/hello is used by some clients as a lightweight endpoint probe.
-    # It must never be forwarded to AgentRouter.
-    if path.strip("/").lower() == "api/hello":
-        return Response(status_code=204)
 
     target_url = f"{TARGET_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
     if request.url.query:
@@ -106,8 +98,7 @@ async def proxy(path: str, request: Request):
     if is_claude_messages(path):
         headers = apply_dynamic_claude_code_wire_image(headers)
 
-    if DEBUG_MODE:
-        print(f"[Proxy] {request.method} /{path} -> {target_url}")
+    print(f"[Proxy] {request.method} /{path} -> {target_url}")
 
     try:
         response = await http_client.send(
@@ -160,6 +151,22 @@ async def proxy(path: str, request: Request):
     except httpx.HTTPError as exc:
         print(f"[Upstream] error {request.method} /{path}: {exc}")
         return JSONResponse({"error": "upstream connection error"}, status_code=502)
+
+
+# Explicit /v1 route prevents another mounted router from producing a local 405.
+# It is intentionally registered before the generic catch-all.
+@app.api_route(
+    "/v1/{path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+)
+async def v1_proxy(path: str, request: Request):
+    return await proxy_request(f"v1/{path}", request)
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+async def proxy(path: str, request: Request):
+    # /api/hello is handled locally above; all remaining paths use the upstream proxy.
+    return await proxy_request(path, request)
 
 
 if __name__ == "__main__":
