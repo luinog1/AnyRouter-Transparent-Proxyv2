@@ -21,7 +21,6 @@ PORT = int(os.getenv("PORT", "8000"))
 http_client = httpx.AsyncClient(
     timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0),
     follow_redirects=False,
-    http2=True,
 )
 
 
